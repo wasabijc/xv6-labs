@@ -5,6 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -303,7 +305,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
+  //char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -311,14 +313,21 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
+    if(*pte & PTE_W){
+      //如果有写权限，清除写权限标志，设置懒拷贝标志
+      *pte = (*pte & ~PTE_W) | PTE_COW;
+    }
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    /* if((mem = kalloc()) == 0)
+       goto err;
+     memmove(mem, (char*)pa, PGSIZE);*/
+
+    //懒拷贝：把父进程的页表映射到子
+    if(mappages(new, i, PGSIZE, (uint64)pa, flags) != 0){
+      //kfree(mem);
       goto err;
     }
+    krefpage((void*)pa);//增加引用计数
   }
   return 0;
 
@@ -349,6 +358,8 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
   uint64 n, va0, pa0;
 
   while(len > 0){
+    if(uvmcheckcowpage(dstva)) // 检查每一个被写的页是否是 COW 页
+      uvmcowcopy(dstva); // 如果是 COW 页，复制一份
     va0 = PGROUNDDOWN(dstva);
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
@@ -431,4 +442,35 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+// 检查是否是 COW 页
+int uvmcheckcowpage(uint64 va){
+  pte_t *pte;
+  struct  proc *p = myproc();
+
+  return va < p->sz //虚拟地址在进程的地址空间内
+        && (pte = walk(p->pagetable, va, 0)) != 0//获取并检查pte是否存在 
+        && (*pte & PTE_COW) && (*pte & PTE_V);//cow和有效位
+}
+
+// 复制 COW 页
+int uvmcowcopy(uint64 va){
+  pte_t *pte;
+  struct proc *p = myproc();
+
+  if ((pte = walk(p->pagetable, va, 0)) == 0)//获取并检查pte是否存在
+    panic("uvmcowcopy: walk");
+
+  uint64 pa = PTE2PA(*pte);//物理地址
+  uint64 new = (uint64)kcopy_n_deref((void *)pa);//复制物理页
+  if (new == 0)//内存不足无法分配
+    return -1;
+  
+  uint64 flag = (PTE_FLAGS(*pte)|PTE_W) & ~PTE_COW;//提取标志位，清除cow标志，设置写权限
+  uvmunmap(p->pagetable, PGROUNDDOWN(va), 1, 0);//解除映射
+  if(mappages(p->pagetable, va, 1, new, flag) == 1){//映射新页
+    panic("uvmcowcopy: mappages");
+  }
+  return 0;
 }
