@@ -15,6 +15,7 @@
 #include "sleeplock.h"
 #include "file.h"
 #include "fcntl.h"
+#include "memlayout.h"
 
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
@@ -483,4 +484,150 @@ sys_pipe(void)
     return -1;
   }
   return 0;
+}
+
+uint64
+sys_mmap(void){
+  uint64 addr,sz,offset;
+  int prot,fd,flags;
+  struct file *f;
+
+  //检测参数是否有效
+  if(argaddr(0,&addr)<0 || argaddr(1,&sz)<0 || argint(2,&prot)<0 || argint(3,&flags)<0  
+      || argfd(4,&fd,&f)<0|| argaddr(5,&offset)<0 || sz == 0)
+    return -1;
+  //检查可读性和可写性
+  if((!f->readable && (prot & PROT_READ))//不可读但请求读权限
+      || (!f->writable && (prot & PROT_WRITE) && !(flags & MAP_PRIVATE)))//不可写但请求写权限且不是私有映射
+    return -1;
+
+  sz = PGROUNDUP(sz);//向上取整到页大小的倍数
+  struct proc *p = myproc();
+  struct vma *v = 0;
+  uint64 vaend = MMAPEND;
+  //找到一个空闲的vma
+  for(int i=0;i<NVMA;i++) {
+    struct vma *vv = &p->vmas[i];
+    if(vv->valid == 0) {//空闲
+      if(v == 0) {
+        v = &p->vmas[i];
+        // found free vma;
+        v->valid = 1;
+      }
+    } else if(vv->vastart < vaend) {//更新vaend
+      vaend = PGROUNDDOWN(vv->vastart);
+    }
+  }
+
+  if(v == 0){//没有找到空闲的vma
+    panic("mmap: no free vma");
+  }
+  //设置
+  v->vastart = vaend - sz;
+  v->sz = sz;
+  v->prot = prot;
+  v->flags = flags;
+  v->f = f; // assume f->type == FD_INODE
+  v->offset = offset;
+
+  filedup(v->f);//增加引用计数
+
+  return v->vastart;
+}
+
+//查找与va对应的vma
+struct vma *findvma(struct proc *p, uint64 va) {
+  for(int i=0;i<NVMA;i++) {
+    struct vma *v = &p->vmas[i];
+    if(v->valid == 1 && va >= v->vastart && va < v->vastart + v->sz) {//检查是否在vma范围内
+      return v;
+    }
+  }
+  return 0;
+}
+
+//对映射的页实行懒加载，仅在访问到的时候才从磁盘中加载出来，
+int vmatrylazytouch(uint64 va) {
+  struct proc *p = myproc();
+  struct vma *v = findvma(p, va);
+  if(v == 0) {//没有找到
+    return 0;
+  }
+
+  // 分配物理页
+  void *pa = kalloc();
+  if(pa == 0) {
+    panic("vmalazytouch: kalloc");
+  }
+  memset(pa, 0, PGSIZE);
+  
+  // 读取数据
+  begin_op();
+  ilock(v->f->ip);
+  readi(v->f->ip, 0, (uint64)pa, v->offset + PGROUNDDOWN(va - v->vastart), PGSIZE);
+  iunlock(v->f->ip);
+  end_op();
+
+  // 设置权限
+  int perm = PTE_U;
+  if(v->prot & PROT_READ)
+    perm |= PTE_R;
+  if(v->prot & PROT_WRITE)
+    perm |= PTE_W;
+  if(v->prot & PROT_EXEC)
+    perm |= PTE_X;
+
+  if(mappages(p->pagetable, va, PGSIZE, (uint64)pa, PTE_R | PTE_W | PTE_U) < 0) {
+    panic("vmalazytouch: mappages");
+  }
+
+  return 1;
+}
+
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr, sz;
+
+  if(argaddr(0, &addr) < 0 || argaddr(1, &sz) < 0 || sz == 0)//检查参数
+    return -1;
+
+  struct proc *p = myproc();
+
+  struct vma *v = findvma(p, addr);
+  if(v == 0) {
+    return -1;
+  }
+
+  if(addr > v->vastart && addr + sz < v->vastart + v->sz) {
+    // 尝试在内存范围内分配一段地址
+    return -1;
+  }
+  //addr向上对齐到页边界
+  uint64 addr_aligned = addr;
+  if(addr > v->vastart) {
+    addr_aligned = PGROUNDUP(addr);
+  }
+  //计算需要解除映射的大小
+  int nunmap = sz - (addr_aligned-addr); 
+  if(nunmap < 0)
+    nunmap = 0;
+  
+  vmaunmap(p->pagetable, addr_aligned, nunmap, v); //解除映射
+
+  if(addr <= v->vastart && addr + sz > v->vastart) { //解除映射的范围包含了vma的起始地址
+    //更新offset和vastart
+    v->offset += addr + sz - v->vastart;
+    v->vastart = addr + sz;
+  }
+  v->sz -= sz;
+
+  //关闭文件，标记空闲
+  if(v->sz <= 0) {
+    fileclose(v->f);
+    v->valid = 0;
+  }
+
+  return 0;  
 }
